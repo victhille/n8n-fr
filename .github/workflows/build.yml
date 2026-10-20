@@ -1,0 +1,154 @@
+name: Build n8n-fr
+
+# Every day: if n8n published a version not built yet, build its editor with the
+# French texts and publish the Docker image and the release. A change to the
+# translations rebuilds the latest version. No translation happens here: new
+# n8n texts stay in English until languages/fr.json is updated.
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  push:
+    branches: [main]
+    paths: ['languages/**', 'Dockerfile', 'script/patch-n8n.mjs', '.github/workflows/build.yml']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version de n8n (vide = la dernière)'
+        required: false
+      force:
+        description: 'Reconstruire même si la version existe déjà'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/n8n-fr
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: pack
+
+      - name: Version
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          FORCE: ${{ inputs.force || github.event_name == 'push' }}
+        run: |
+          VERSION="$INPUT_VERSION"
+          if [ -z "$VERSION" ]; then
+            VERSION=$(gh api repos/n8n-io/n8n/releases/latest --jq .tag_name)
+          fi
+          VERSION="${VERSION#n8n@}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" != "true" ] && gh release view "n8n-$VERSION" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "n8n $VERSION est déjà construit." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-node@v4
+        if: steps.v.outputs.skip == 'false'
+        with:
+          node-version: 24
+
+      - name: Traductions
+        if: steps.v.outputs.skip == 'false'
+        working-directory: pack
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node script/update-en.mjs "${{ steps.v.outputs.version }}" | tee status.txt
+          node script/status.mjs --list > missing.txt || { cat missing.txt; exit 1; }
+          {
+            echo "## n8n ${{ steps.v.outputs.version }}"
+            tail -n 1 status.txt
+            echo
+            echo "Les textes non traduits s'affichent en anglais."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Récupérer n8n
+        if: steps.v.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: n8n-io/n8n
+          ref: n8n@${{ steps.v.outputs.version }}
+          path: n8n
+
+      - name: Ajouter le français
+        if: steps.v.outputs.skip == 'false'
+        run: node pack/script/patch-n8n.mjs n8n
+
+      - name: Construire l'interface
+        if: steps.v.outputs.skip == 'false'
+        working-directory: n8n
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
+          TURBO_TELEMETRY_DISABLED: '1'
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm exec turbo run build --filter=n8n-editor-ui
+          DIST=packages/frontend/editor-ui/dist
+          test -f "$DIST/index.html"
+          grep -rlq "Identifiants" "$DIST/assets" || { echo "Les textes français ne sont pas dans le build"; exit 1; }
+          cp -r "$DIST" ../pack/editor-ui-dist
+          tar -czf ../editor-ui.tar.gz -C packages/frontend/editor-ui dist
+
+      - uses: docker/setup-qemu-action@v3
+        if: steps.v.outputs.skip == 'false'
+      - uses: docker/setup-buildx-action@v3
+        if: steps.v.outputs.skip == 'false'
+      - uses: docker/login-action@v3
+        if: steps.v.outputs.skip == 'false'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Image Docker
+        if: steps.v.outputs.skip == 'false'
+        working-directory: pack
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          LATEST=$(gh api repos/n8n-io/n8n/releases/latest --jq .tag_name)
+          TAGS="-t $IMAGE:$VERSION"
+          if [ "n8n@$VERSION" = "$LATEST" ]; then TAGS="$TAGS -t $IMAGE:latest"; fi
+          docker buildx build --platform linux/amd64,linux/arm64 --build-arg VERSION="$VERSION" $TAGS --push .
+
+      - name: Release
+        if: steps.v.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          STATUS=$(tail -n 1 pack/status.txt)
+          NOTES=$(printf 'Interface de n8n %s en français.\n\n%s\n\nImage Docker : `%s:%s`\n\nLes textes non traduits s'"'"'affichent en anglais.' "$VERSION" "$STATUS" "$IMAGE" "$VERSION")
+          if gh release view "n8n-$VERSION" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "n8n-$VERSION" editor-ui.tar.gz --clobber -R "$GITHUB_REPOSITORY"
+            gh release edit "n8n-$VERSION" --notes "$NOTES" -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "n8n-$VERSION" editor-ui.tar.gz --title "n8n $VERSION" --notes "$NOTES" --target "$GITHUB_SHA" -R "$GITHUB_REPOSITORY"
+          fi
+
+      - name: Textes à traduire
+        if: steps.v.outputs.skip == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: textes-a-traduire-${{ steps.v.outputs.version }}
+          path: pack/missing.txt
