@@ -17,14 +17,18 @@ export function report() {
   const translatable = Object.keys(en).filter(k => !untranslatable(en[k]))
   const missing = translatable.filter(k => fr[k] === undefined).map(showKey)
   const outdated = translatable.filter(k => fr[k] !== undefined && source[showKey(k)] !== en[k]).map(showKey)
-  const broken = Object.keys(fr)
-    .filter(k => en[k] !== undefined && !untranslatable(en[k]))
+  // A translation n8n changed in English since is only stale: patch-n8n.mjs leaves
+  // it out of the build when it no longer fits, so it does not count as an error
+  const checked = Object.keys(fr).filter(k => en[k] !== undefined && !untranslatable(en[k]))
+  const broken = checked
+    .filter(k => source[showKey(k)] === en[k])
     .flatMap(k => check(en[k], fr[k]).map(e => `${showKey(k)}: ${e}`))
+  const dropped = checked.filter(k => source[showKey(k)] !== en[k] && check(en[k], fr[k]).length).map(showKey)
   const done = translatable.length - missing.length - outdated.length
   const pct = Math.floor((done / translatable.length) * 1000) / 10
   return {
-    missing, outdated, broken, done, total: translatable.length, pct,
-    line: `${done}/${translatable.length} traduits (${pct} %) · ${missing.length} nouveaux · ${outdated.length} modifiés en anglais · ${broken.length} erreur(s)`
+    missing, outdated, dropped, broken, done, total: translatable.length, pct,
+    line: `${done}/${translatable.length} traduits (${pct} %) · ${missing.length} nouveaux · ${outdated.length} modifiés en anglais (${dropped.length} affichés en anglais) · ${broken.length} erreur(s)`
   }
 }
 
@@ -34,6 +38,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   if (process.argv.includes('--list')) {
     for (const k of r.missing) console.log(`  nouveau   ${k}`)
     for (const k of r.outdated) console.log(`  modifié   ${k}`)
+    for (const k of r.dropped) console.log(`  écarté    ${k}`)
   }
   for (const e of r.broken) console.log(`  erreur    ${e}`)
   process.exitCode = r.broken.length ? 1 : 0
